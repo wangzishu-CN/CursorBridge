@@ -1,0 +1,5 @@
+# Registers the cursor-bridge plugin. The bundle is a plain JS package, so a
+# git install needs no build step and no allowBuilds entry.
+- insert:
+    - id: cursor-bridge
+      name: dsh-cursor-bridge
