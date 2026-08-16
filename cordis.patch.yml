@@ -1,10 +1,15 @@
-# Registers the `cursor` subagent provider and exposes the delegation tool.
+# Registers the `cursor` subagent provider and the delegation tool, and points
+# the web agent-preset default at the standard-cursor composition (created on
+# apply from presets/standard-cursor/agent.cordis.yml, if absent).
+#
 # The bundle is a plain JS package, so a git install needs no build step and
 # no allowBuilds entry. tool-subagent-cursor mounts only when the provider is
 # registered (the tool plugin watches subagent/provider-added).
 - insert:
     - id: cursor-bridge
       name: dsh-cursor-bridge
+
+    # Global delegation row: serves non-preset compositions (headless, TUI).
     - id: tool-subagent-cursor
       name: '@deepseek-ai/dsh-tool-subagent'
       config:
@@ -13,3 +18,10 @@
         backgroundMode: one-shot
         # cursor 不实现 depthLimit，递归预算交给 Cursor 自己
         maxDepth: 'provider-managed'
+
+# Web sessions compose their tools from an agent preset, and the shipped
+# `standard` preset does not carry product-provider tools. Default the roster
+# to the standard-cursor composition this bundle installs under the user root.
+- id: agent-presets
+  config:
+    default: standard-cursor

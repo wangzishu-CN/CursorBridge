@@ -10,8 +10,17 @@
 // below) instead of importing @deepseek-ai/dsh-subagent, because the npm
 // release trails the installed runtime; the runtime services are called by
 // shape only.
+//
+// Web sessions get their tools from an agent preset, so apply() also installs
+// the standard-cursor composition under the user preset root when missing; the
+// bundle patch points the roster default at it.
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { constants } from 'node:fs'
+import { copyFile, mkdir } from 'node:fs/promises'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import z from '@deepseek-ai/schemastery'
 
 export const name = 'cursor-bridge'
@@ -243,5 +252,23 @@ class CursorProvider {
 }
 
 export function apply(ctx, config) {
+  installPreset(ctx).catch((error) => {
+    ctx.logger.warn(`cursor-bridge: preset install failed: ${error.message}`)
+  })
   ctx.subagents.registerProvider(new CursorProvider(ctx, config))
+}
+
+// Copy presets/standard-cursor into $DSH_HOME/.agent-presets when the user has
+// no composition of that id yet. Idempotent; never touches an existing preset.
+async function installPreset(ctx) {
+  const dshHome = process.env.DSH_HOME ?? join(homedir(), '.dsh')
+  const target = join(dshHome, '.agent-presets', 'standard-cursor', 'agent.cordis.yml')
+  const source = fileURLToPath(new URL('./presets/standard-cursor/agent.cordis.yml', import.meta.url))
+  await mkdir(dirname(target), { recursive: true })
+  try {
+    await copyFile(source, target, constants.COPYFILE_EXCL)
+    ctx.logger.info(`cursor-bridge: installed agent preset standard-cursor at ${target}`)
+  } catch (error) {
+    if (error.code !== 'EEXIST') throw error
+  }
 }

@@ -20,7 +20,24 @@ dsh plugin --profile web add github:wangzishu-CN/CursorBridge
 
 包是纯 JS，没有构建脚本，git 安装后直接能用，不需要 allowBuilds 授权。
 
-装完后 DSH 的主 Agent 会多一个 `subagent_cursor` 委派工具，同时 `cursor` 提供方出现在子 Agent 提供方列表里。
+装完**重启 DSH 后**：`cursor` 提供方进入子 Agent 提供方列表；**新建的 web 会话**会带 `subagent_cursor` 委派工具。
+
+## Web 会话与 agent preset
+
+web 组合里每个会话的工具集来自 agent preset（默认 `standard`），而 `standard` 刻意不带产品提供方工具。本插件会：
+
+1. 在 `$DSH_HOME/.agent-presets/standard-cursor/` 安装一份组合（复制 `standard` 并加入 `subagent_cursor` 行；已存在时不覆盖）
+2. 通过 bundle patch 把 agent preset 默认值改为 `standard-cursor`
+
+因此 **web 的新会话**自动获得 `subagent_cursor`；**已有会话**仍保持创建时的组合，需要在新会话里使用。headless/TUI 组合不走 preset，直接生效。
+
+不想让默认 preset 指向它时，在 profile 的 `cordis.patch.yml` 里覆盖：
+
+```yaml
+- id: agent-presets
+  config:
+    default: standard
+```
 
 ## 配置
 
