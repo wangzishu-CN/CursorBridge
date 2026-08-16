@@ -1,0 +1,3 @@
+name: 自定义插件模式
+description: 具备标准模式的全部能力，并可使用自定义插件提供的工具（如本地 Cursor 子 Agent）。
+order: 5

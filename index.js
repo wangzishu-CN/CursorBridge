@@ -19,7 +19,7 @@ import { randomUUID } from 'node:crypto'
 import { constants } from 'node:fs'
 import { copyFile, mkdir } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { dirname, join } from 'node:path'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import z from '@deepseek-ai/schemastery'
 
@@ -260,15 +260,18 @@ export function apply(ctx, config) {
 
 // Copy presets/standard-cursor into $DSH_HOME/.agent-presets when the user has
 // no composition of that id yet. Idempotent; never touches an existing preset.
+const PRESET_FILES = ['agent.cordis.yml', 'preset.yml']
 async function installPreset(ctx) {
   const dshHome = process.env.DSH_HOME ?? join(homedir(), '.dsh')
-  const target = join(dshHome, '.agent-presets', 'standard-cursor', 'agent.cordis.yml')
-  const source = fileURLToPath(new URL('./presets/standard-cursor/agent.cordis.yml', import.meta.url))
-  await mkdir(dirname(target), { recursive: true })
-  try {
-    await copyFile(source, target, constants.COPYFILE_EXCL)
-    ctx.logger.info(`cursor-bridge: installed agent preset standard-cursor at ${target}`)
-  } catch (error) {
-    if (error.code !== 'EEXIST') throw error
+  const presetDir = join(dshHome, '.agent-presets', 'standard-cursor')
+  const sourceDir = fileURLToPath(new URL('./presets/standard-cursor/', import.meta.url))
+  await mkdir(presetDir, { recursive: true })
+  for (const file of PRESET_FILES) {
+    try {
+      await copyFile(join(sourceDir, file), join(presetDir, file), constants.COPYFILE_EXCL)
+      ctx.logger.info(`cursor-bridge: installed preset file ${file}`)
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error
+    }
   }
 }

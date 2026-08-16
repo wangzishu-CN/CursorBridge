@@ -24,12 +24,12 @@ dsh plugin --profile web add github:wangzishu-CN/CursorBridge
 
 ## Web 会话与 agent preset
 
-web 组合里每个会话的工具集来自 agent preset（默认 `standard`），而 `standard` 刻意不带产品提供方工具。本插件会：
+web 组合里每个会话的工具集来自 agent preset（默认 `standard`，UI 里叫"标准模式"），而 `standard` 刻意不带产品提供方工具。本插件会：
 
-1. 在 `$DSH_HOME/.agent-presets/standard-cursor/` 安装一份组合（复制 `standard` 并加入 `subagent_cursor` 行；已存在时不覆盖）
+1. 在 `$DSH_HOME/.agent-presets/standard-cursor/` 安装一份组合（复制 `standard` 并加入 `subagent_cursor` 行；已存在时不覆盖），UI 显示名为"**自定义插件模式**"
 2. 通过 bundle patch 把 agent preset 默认值改为 `standard-cursor`
 
-因此 **web 的新会话**自动获得 `subagent_cursor`；**已有会话**仍保持创建时的组合，需要在新会话里使用。headless/TUI 组合不走 preset，直接生效。
+因此 **web 的新会话**自动使用"自定义插件模式"（具备标准模式的全部能力，并可使用自定义插件提供的工具）；**已有会话**仍保持创建时的模式，需要在新会话里使用。headless/TUI 组合不走 preset，直接生效。
 
 不想让默认 preset 指向它时，在 profile 的 `cordis.patch.yml` 里覆盖：
 
