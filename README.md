@@ -1,8 +1,8 @@
 # CursorBridge
 
-DSH 插件：给 DSH 的主 Agent 加一个 `cursor_cli` 工具，把任务转交给本机安装的 Cursor CLI（`agent`）去跑，再拿回它的输出。
+DSH 插件：把本机安装的 Cursor CLI 注册成 DSH 的一个子 Agent 提供方（provider 名 `cursor`）。DSH 主 Agent 需要时通过标准的子 Agent 委派工具把任务交过去，Cursor 在自己的工作目录里跑完，结果作为子 Agent 的产出回到主 Agent 的对话里。
 
-做这个插件的原因很简单：DSH 主 Agent 和 Cursor 的编码 Agent 各有所长，有些活（大范围重构、反复跑测试修 bug、需要长上下文的工作）直接甩给 Cursor 效果更好，而且两边额度独立，可以换着用。
+和"把 cursor 当工具调"不同，走的是 DSH 的 subagent seam：委派、取消、结果映射、会话归属都由 DSH 自己管，Cursor 只是其中一个后端——就像 DSH 自带的 `spawn`/`fork`/`codex`/`claude-code` 提供方一样。
 
 ## 安装
 
@@ -12,7 +12,7 @@ DSH 插件：给 DSH 的主 Agent 加一个 `cursor_cli` 工具，把任务转�
 curl https://cursor.com/install -fsS | bash
 ```
 
-然后把本仓库作为 bundle 装进 profile（把 `web` 换成你自己的 profile 名）：
+把本仓库作为 bundle 装进 profile（把 `web` 换成你自己的 profile 名）：
 
 ```sh
 dsh plugin --profile web add github:wangzishu-CN/CursorBridge
@@ -20,9 +20,11 @@ dsh plugin --profile web add github:wangzishu-CN/CursorBridge
 
 包是纯 JS，没有构建脚本，git 安装后直接能用，不需要 allowBuilds 授权。
 
+装完后 DSH 的主 Agent 会多一个 `subagent_cursor` 委派工具，同时 `cursor` 提供方出现在子 Agent 提供方列表里。
+
 ## 配置
 
-默认配置对 Windows + WSL 开箱即用（自动走 `wsl -e`），一般不用改。可选项：
+默认配置对 Windows + WSL 开箱即用。可选项：
 
 ```yaml
 # profile 的 cordis.patch.yml
@@ -30,40 +32,36 @@ dsh plugin --profile web add github:wangzishu-CN/CursorBridge
   config:
     useWsl: true          # Windows 下经 WSL 调用
     command: agent        # Cursor CLI 可执行名
-    maxOutputChars: 30000 # 返回给模型的输出上限
-    defaultTimeoutMs: 600000
-    allowForce: true      # 加 --force 让 Cursor 自主执行命令
+    model: ""             # 固定传给 Cursor 的模型，留空用 CLI 配置
+    force: true           # 加 --force 让 Cursor 自主执行命令
+    maxOutputChars: 30000 # 返回给主 Agent 的输出上限
+    disposeGraceMs: 3000  # 终止子进程的宽限时间
 ```
 
 ## 使用
 
-主 Agent 会自己判断什么时候用这个工具，直接跟它说就行，例如：
+主 Agent 会自己判断什么时候派活，直接跟它说就行，例如：
 
 > 让 Cursor 把 src/ 下的 auth 模块重构一遍，补齐测试。
 
-工具参数：
-
-| 参数 | 必填 | 说明 |
-|---|---|---|
-| prompt | 是 | 给 Cursor 的任务描述 |
-| workspace | 否 | 工作目录（Windows 路径会自动转成 WSL 路径） |
-| model | 否 | 指定 Cursor 模型，如 composer-2-fast |
-| timeoutMs | 否 | 覆盖默认超时 |
+委派工具的参数和 DSH 其他子 Agent 工具一致：`description`（委派说明，作为子 Agent 的显示标签）、`prompt`（任务内容）。子 Agent 的工作目录取父会话的 cwd，Windows 路径会自动转成 WSL 路径。
 
 ## 工作原理
 
-- Windows 上 `spawn('wsl', ['-e', 'agent', ...])`，参数走数组传递、不经过 shell，提示词里有什么特殊字符都不会被解析
-- 非 Windows 平台直接执行 `agent`
-- Cursor 跑在 `--print` 无头模式，加 `--force` 让它自主执行 shell 命令；不加的话命令审批在无头模式下会被直接拒绝，任务会卡住
-- 输出默认截断 30000 字符，完整输出写到临时文件，路径会在结果里给出
-- 默认超时 10 分钟，到点杀掉 Cursor 进程，把已产生的输出返回
+- 插件向 `ctx.subagents` 注册名为 `cursor` 的提供方，只做一键式（one-shot）委派，不实现可继续会话
+- Windows 上 `spawn('wsl', ['-e', ...])`，参数数组直传、不经过 shell，提示词里有什么特殊字符都不会被解析；非 Windows 平台直接执行 `agent`
+- 由于 `wsl -e` 不加载登录 shell 的 PATH（`agent` 通常装在 `~/.local/bin`），首次调用会先经 `bash -lc "command -v agent"` 解析出绝对路径并缓存
+- Cursor 跑在 `--print` 无头模式，加 `--force` 自主执行 shell 命令；不加的话命令审批在无头模式下会被直接拒绝，任务会卡住
+- 退出码 0 且有输出 → 子 Agent 正常完成；退出码非 0（如额度报错）→ 失败，stderr 摘要随输出返回；父级取消 → 杀掉进程树，按 aborted 结算
+- 输出默认截断 30000 字符，截断时给出总长度
 
 ## 已知限制
 
 - 依赖 Cursor CLI 的登录状态和额度。API 模型额度用尽时（报 `You've hit your usage limit`）任务会直接失败；用 auto 系模型（composer-*）一般没问题
-- `--force` 意味着 Cursor 拥有完整的本机权限，只应在信任的环境里用；不信任就把 `allowForce` 关掉（代价是 Cursor 会卡在命令审批上）
-- 一次调用串行执行一个任务，没有并发
+- `--force` 意味着 Cursor 拥有完整的本机权限，只应在信任的环境里用；不信任就把 `force` 关掉（代价是 Cursor 会卡在命令审批上）
+- 一键式委派：没有跨轮次的会话恢复，也没有 `send_message`/`interrupt` 控制工具（那些只对可继续子 Agent 生效）
 - 只回传文本输出；Cursor 完整的工具调用记录在它自己的 `~/.cursor/projects/<项目>/agent-transcripts/` 里
+- web 组合默认禁用子 Agent 控制工具，需要的话在 profile 里自行启用 `tool-subagent-control`
 
 ## License
 

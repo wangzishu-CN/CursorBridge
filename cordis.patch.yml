@@ -1,5 +1,15 @@
-# Registers the cursor-bridge plugin. The bundle is a plain JS package, so a
-# git install needs no build step and no allowBuilds entry.
+# Registers the `cursor` subagent provider and exposes the delegation tool.
+# The bundle is a plain JS package, so a git install needs no build step and
+# no allowBuilds entry. tool-subagent-cursor mounts only when the provider is
+# registered (the tool plugin watches subagent/provider-added).
 - insert:
     - id: cursor-bridge
       name: dsh-cursor-bridge
+    - id: tool-subagent-cursor
+      name: '@deepseek-ai/dsh-tool-subagent'
+      config:
+        provider: cursor
+        toolName: subagent_cursor
+        backgroundMode: one-shot
+        # cursor 不实现 depthLimit，递归预算交给 Cursor 自己
+        maxDepth: 'provider-managed'

@@ -1,32 +1,49 @@
 // @ts-check
-// cursor-bridge: a DSH tool that delegates a task to the local Cursor CLI.
+// cursor-bridge: registers `cursor` as a DSH subagent provider. The main agent
+// delegates through the standard subagent tool; this provider spawns the local
+// Cursor CLI (`agent`) and turns its text output into the child result.
 //
-// The tool spawns `agent` (the Cursor CLI) with the prompt and returns its
-// text output. On Windows the CLI lives inside WSL, so the spawn goes through
-// `wsl -e`; the argument array is passed straight through, no shell involved.
+// On Windows the CLI lives in WSL, so the spawn goes through `wsl -e` with the
+// argument array passed straight through — no shell, nothing to escape.
+//
+// The provider implements the subagent seam contract itself (settle/run-handle
+// below) instead of importing @deepseek-ai/dsh-subagent, because the npm
+// release trails the installed runtime; the runtime services are called by
+// shape only.
 import { spawn } from 'node:child_process'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
-import { randomBytes } from 'node:crypto'
-import { writeFile } from 'node:fs/promises'
-import { defineTool } from '@deepseek-ai/dsh-tools'
+import { randomUUID } from 'node:crypto'
 import z from '@deepseek-ai/schemastery'
 
 export const name = 'cursor-bridge'
-export const inject = ['tools']
+export const inject = ['subagents', 'subprocess']
 
 export const Config = z.object({
   // Windows 下经 WSL 调用；其他平台直接执行
   useWsl: z.boolean().default(process.platform === 'win32'),
-  // Cursor CLI 可执行名，需在 PATH 中（WSL 里通常是 agent）
+  // Cursor CLI 可执行名（WSL 里通常是 agent）
   command: z.string().default('agent'),
-  // 返回给模型的输出上限，超出部分截断、完整输出落临时文件
+  // 固定传给 Cursor 的模型；留空用 CLI 配置的默认模型
+  model: z.string().default(''),
+  // 加 --force，让 Cursor 自主执行 shell 命令（不加会在审批上卡死）
+  force: z.boolean().default(true),
+  // 返回给主 Agent 的输出上限，超出部分截断
   maxOutputChars: z.number().default(30000),
-  // 默认超时（毫秒），单次调用可用 timeoutMs 覆盖
-  defaultTimeoutMs: z.number().default(600000),
-  // 加 --force，让 Cursor agent 自主执行 shell 命令（不加会在审批上卡死）
-  allowForce: z.boolean().default(true),
+  // 子进程终止的宽限时间（毫秒）
+  disposeGraceMs: z.number().default(3000),
 })
+
+// 环境里带敏感名（KEY/PASSWORD/SECRET/TOKEN）的变量不传给子进程。
+// 与 @deepseek-ai/dsh-subprocess 的 scrubbedParentEnv 行为一致。
+const SENSITIVE_ENV_PATTERN = /KEY|PASSWORD|SECRET|TOKEN/i
+function scrubbedParentEnv() {
+  const env = {}
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined && !SENSITIVE_ENV_PATTERN.test(key)) {
+      env[key] = value
+    }
+  }
+  return env
+}
 
 // C:\foo\bar -> /mnt/c/foo/bar
 function toWslPath(p) {
@@ -34,127 +51,197 @@ function toWslPath(p) {
   return '/mnt/' + p[0].toLowerCase() + '/' + p.slice(3).replaceAll('\\', '/')
 }
 
-// `wsl -e` 直接 exec 程序，不经过 shell，也就没有登录 shell 的 PATH
-// （agent 通常装在 ~/.local/bin）。先经 bash 解析出绝对路径再执行。
-let commandPathCache = null
-async function resolveCommand(config) {
-  if (!config.useWsl) return config.command
-  if (commandPathCache) return commandPathCache
-  const { stdout } = await runAgent(['wsl', '-e', 'bash', '-lc', `command -v ${config.command} || true`], {
-    timeoutMs: 15000,
-    signal: undefined,
-  })
-  commandPathCache = stdout.trim().split('\n')[0] || null
-  return commandPathCache
-}
-
-function buildArgv(commandPath, config, args) {
-  const argv = []
-  if (config.useWsl) argv.push('wsl', '-e')
-  argv.push(
-    commandPath,
-    '-p', args.prompt,
-    '--trust',
-    '--print',
-    '--output-format', 'text',
-  )
-  if (config.allowForce) argv.push('--force')
-  if (args.model) argv.push('--model', args.model)
-  if (args.workspace) {
-    argv.push('--workspace', config.useWsl ? toWslPath(args.workspace) : args.workspace)
+// 子任务只允许文本块，按顺序拼成一个提示词
+function textTask(prompt) {
+  const texts = []
+  for (const block of prompt) {
+    if (block.type !== 'text') {
+      throw new Error('cursor-bridge: the delegated task must contain only text blocks')
+    }
+    texts.push(block.text)
   }
-  return argv
+  if (texts.length === 0 || texts.every((t) => t.trim().length === 0)) {
+    throw new Error('cursor-bridge: the delegated task must not be empty')
+  }
+  return texts.join('\n')
 }
 
-function runAgent(argv, { timeoutMs, signal }) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(argv[0], argv.slice(1), {
-      windowsHide: true,
-      stdio: ['ignore', 'pipe', 'pipe'],
+// 结算一次子进程 run 的结果：正常完成、本地取消或失败分别映射为
+// completed / aborted / error，与 @deepseek-ai/dsh-subagent 的
+// settleRunResult 行为一致。
+async function settleRunResult(parts) {
+  try {
+    const result = await parts.attempt()
+    return parts.cancelled()
+      ? { output: parts.collectOutput(), stopReason: 'aborted' }
+      : result
+  } catch (error) {
+    if (parts.cancelled()) {
+      return { output: parts.collectOutput(), stopReason: 'aborted' }
+    }
+    try {
+      parts.onError?.(error instanceof Error ? error : new Error(String(error)), 'error')
+    } catch {
+      // 诊断回调本身失败不影响结算
+    }
+    return { output: parts.collectOutput(), stopReason: 'error' }
+  } finally {
+    parts.signal.removeEventListener('abort', parts.onAbort)
+  }
+}
+
+// 发布 subagent run 句柄。dispose 幂等：移除 abort 监听、结算本地取消、
+// 等待进程树真正退出。
+function subprocessRunHandle(parts) {
+  let disposal
+  return {
+    id: parts.id,
+    localAgent: undefined,
+    result: parts.result,
+    dispose() {
+      if (disposal !== undefined) return disposal
+      parts.signal.removeEventListener('abort', parts.onAbort)
+      parts.requestCancel()
+      disposal = parts.teardown()
+      return disposal
+    },
+  }
+}
+
+class CursorProvider {
+  name = 'cursor'
+  // 一键式委派：不支持 outputSchema / depthLimit / toolFilter / persona
+  capabilities = Object.freeze({
+    outputSchema: false,
+    depthLimit: false,
+    toolFilter: false,
+    persona: false,
+  })
+  inheritsParentContext = false
+
+  constructor(ctx, config) {
+    this.ctx = ctx
+    this.config = config
+    this.commandPath = null
+  }
+
+  // `wsl -e` 直接 exec 程序，不经过 shell，也就没有登录 shell 的 PATH
+  // （agent 通常装在 ~/.local/bin）。先经 bash 解析出绝对路径再执行。
+  async resolveCommand() {
+    if (this.commandPath) return this.commandPath
+    if (!this.config.useWsl) {
+      this.commandPath = this.config.command
+      return this.commandPath
+    }
+    const child = this.ctx.subprocess.spawn({
+      argv: ['wsl', '-e', 'bash', '-lc', `command -v ${this.config.command} || true`],
+      cwd: process.cwd(),
+      stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'ignore' },
+      graceMs: this.config.disposeGraceMs,
+      env: scrubbedParentEnv(),
     })
+    let out = ''
+    child.stdout?.on('data', (d) => { out += d })
+    await child.done
+    this.commandPath = out.trim().split('\n')[0] || null
+    return this.commandPath
+  }
+
+  async start(request) {
+    const prompt = textTask(request.prompt)
+    if (request.signal.aborted) {
+      throw new Error('cursor-bridge: request was aborted before CLI startup')
+    }
+
+    const parentCwd = request.parent.session.header.cwd
+    if (parentCwd === undefined) {
+      throw new Error('cursor-bridge: no working directory for the child — delegate from a parent session that has one')
+    }
+    const commandPath = await this.resolveCommand()
+    if (!commandPath) {
+      throw new Error(`cursor-bridge: "${this.config.command}" not found; install Cursor CLI with: curl https://cursor.com/install -fsS | bash`)
+    }
+
+    const argv = []
+    if (this.config.useWsl) argv.push('wsl', '-e')
+    argv.push(commandPath, '-p', prompt, '--trust', '--print', '--output-format', 'text')
+    if (this.config.force) argv.push('--force')
+    if (this.config.model) argv.push('--model', this.config.model)
+    argv.push('--workspace', this.config.useWsl ? toWslPath(parentCwd) : parentCwd)
+
+    const child = this.ctx.subprocess.spawn({
+      argv,
+      cwd: parentCwd,
+      stdio: { stdin: 'ignore', stdout: 'pipe', stderr: 'pipe' },
+      graceMs: this.config.disposeGraceMs,
+      env: scrubbedParentEnv(),
+    })
+
     let stdout = ''
     let stderr = ''
-    let settled = false
+    child.stdout?.on('data', (d) => { stdout += d })
+    child.stderr?.on('data', (d) => { stderr += d })
 
-    const timer = setTimeout(() => {
-      child.kill()
-      settled = true
-      resolve({ code: null, stdout, stderr, timedOut: true })
-    }, timeoutMs)
+    const runAbort = new AbortController()
+    const requestCancel = () => {
+      if (runAbort.signal.aborted) return
+      runAbort.abort(new Error('cursor-bridge: run cancelled locally'))
+      child.terminate()
+    }
+    const onAbort = () => { requestCancel() }
+    request.signal.addEventListener('abort', onAbort, { once: true })
 
-    const kill = () => child.kill()
-    if (signal?.aborted) kill()
-    else signal?.addEventListener('abort', kill, { once: true })
+    const dispose = async () => {
+      child.terminate()
+      await child.waitForExit().catch(() => {})
+      await child.done.catch(() => {})
+    }
 
-    child.stdout.on('data', (d) => { stdout += d })
-    child.stderr.on('data', (d) => { stderr += d })
-    child.on('error', (err) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      reject(err)
+    const collectOutput = () => {
+      const full = [stdout, stderr && `[stderr]\n${stderr}`].filter(Boolean).join('\n').trim()
+      if (!full) return []
+      if (full.length <= this.config.maxOutputChars) {
+        return [{ type: 'text', text: full }]
+      }
+      const tail = full.slice(-this.config.maxOutputChars)
+      return [{ type: 'text', text: `[output truncated, ${full.length} chars total]\n${tail}` }]
+    }
+
+    const result = settleRunResult({
+      attempt: async () => {
+        const outcome = await child.done
+        if (runAbort.signal.aborted) {
+          return { output: collectOutput(), stopReason: 'aborted' }
+        }
+        if (outcome.exitCode !== 0) {
+          throw new Error(`cursor-bridge: CLI exited with code ${String(outcome.exitCode)}`)
+        }
+        const output = collectOutput()
+        if (output.length === 0) {
+          throw new Error('cursor-bridge: CLI exited 0 but produced no output')
+        }
+        return { output, stopReason: 'completed' }
+      },
+      collectOutput,
+      cancelled: () => runAbort.signal.aborted,
+      onError: (error, stopReason) => {
+        this.ctx.logger.warn(`cursor-bridge: child run failed (${stopReason}): ${error.message}`)
+      },
+      signal: request.signal,
+      onAbort,
     })
-    child.on('close', (code) => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolve({ code, stdout, stderr, timedOut: false })
+
+    return subprocessRunHandle({
+      id: randomUUID(),
+      result,
+      signal: request.signal,
+      onAbort,
+      requestCancel,
+      teardown: dispose,
     })
-  })
+  }
 }
 
-export function apply(ctx) {
-  const config = ctx.config
-
-  ctx.tools.register(defineTool({
-    name: 'cursor_cli',
-    description: 'Delegate a task to the local Cursor CLI and return its text output. '
-      + 'Suitable for coding work that needs a long autonomous run (refactor, bug fixing, '
-      + 'test writing): Cursor runs with full shell and file-write access (--force), '
-      + 'works on the given workspace, and reports its own summary. The call blocks until '
-      + 'Cursor finishes or the timeout hits; long outputs are truncated with the full log '
-      + 'path reported in the result.',
-    parameters: {
-      prompt: { type: 'string', required: true, description: 'The task for Cursor, written as you would tell a coding agent.' },
-      workspace: { type: 'string', description: 'Absolute path of the working directory. Defaults to Cursor\'s current directory.' },
-      model: { type: 'string', description: 'Cursor model id, e.g. composer-2-fast or gpt-5.2. Defaults to the CLI-configured model.' },
-      timeoutMs: { type: 'number', description: 'Override the default timeout (milliseconds).' },
-    },
-    output: {
-      schema: { type: 'string' },
-      render: (_args, value) => [{ type: 'text', text: value }],
-    },
-    presentCall: (args) => ({
-      card: 'generic',
-      title: args.prompt.length > 80 ? args.prompt.slice(0, 80) + '…' : args.prompt,
-      kind: 'execute',
-      rawInput: args.prompt,
-    }),
-    async execute(args, exec) {
-      const timeoutMs = args.timeoutMs ?? config.defaultTimeoutMs
-      const commandPath = await resolveCommand(config)
-      if (!commandPath) {
-        throw new Error(`cursor CLI "${config.command}" not found in PATH; install it with: curl https://cursor.com/install -fsS | bash`)
-      }
-      const started = Date.now()
-      const { code, stdout, stderr, timedOut } =
-        await runAgent(buildArgv(commandPath, config, args), { timeoutMs, signal: exec.signal })
-
-      const full = [stdout, stderr && `[stderr]\n${stderr}`].filter(Boolean).join('\n')
-      let output = full
-      let logPath = null
-      if (full.length > config.maxOutputChars) {
-        logPath = join(tmpdir(), `cursor-bridge-${Date.now()}-${randomBytes(4).toString('hex')}.log`)
-        await writeFile(logPath, full, 'utf8')
-        output = full.slice(-config.maxOutputChars)
-      }
-
-      const parts = []
-      if (timedOut) parts.push(`[cursor agent timed out after ${Date.now() - started} ms]`)
-      if (code !== null && code !== 0) parts.push(`[exit code: ${code}]`)
-      if (output) parts.push(output)
-      if (logPath) parts.push(`[output truncated; full log: ${logPath}]`)
-      return parts.join('\n')
-    },
-  }))
+export function apply(ctx, config) {
+  ctx.subagents.registerProvider(new CursorProvider(ctx, config))
 }
